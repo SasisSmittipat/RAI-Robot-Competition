@@ -1,1 +1,36 @@
+import event
+import cyberpi
+import mbot2
+import gamepad
+import time
 
+LEFT_PORT = "M1"
+RIGHT_PORT = "M2"
+
+@event.start
+def main():
+    cyberpi.console.println("Drive Ready")
+    while True:
+        # Read Left Joystick Y (throttle) and X (steering) from Bluetooth Gamepad
+        joyY = gamepad.get_joystick("Ly")
+        joyX = gamepad.get_joystick("Lx")
+
+        # Deadzone to prevent stick drift
+        if abs(joyY) < 10:
+            joyY = 0
+        if abs(joyX) < 10:
+            joyX = 0
+
+        # Arcade drive mixing clamped to [-100, 100]
+        left_speed = max(-100, min(100, joyY + joyX))
+        right_speed = max(-100, min(100, joyY - joyX))
+
+        # For 2-pin DC motors on ports M1 and M2 (power first, port second!)
+        mbot2.motor_set(left_speed, LEFT_PORT)
+        mbot2.motor_set(-right_speed, RIGHT_PORT)
+
+        # NOTE: If using Encoder Motors on EM1 & EM2 instead of M1 & M2,
+        # comment out the two motor_set lines above and uncomment this line:
+        # mbot2.drive_power(left_speed, -right_speed)
+
+        time.sleep(0.02)
