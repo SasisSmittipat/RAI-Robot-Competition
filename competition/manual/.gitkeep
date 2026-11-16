@@ -4,33 +4,282 @@ import mbot2
 import gamepad
 import time
 
-LEFT_PORT = "M1"
-RIGHT_PORT = "M2"
+# Port assignment
+LEFT_DRIVE = "M2"
+RIGHT_DRIVE = "M1"
+ARM_A = "EM1"
+ARM_B = "EM2"
+LEFT_SERVO = "S3"
+RIGHT_SERVO = "S1"
+
+# Drive parameters
+DEADZONE = 10
+DRIVE_DIRECTION = 1
+DRIVE_BOOST = 2.5
+LEFT_BALANCE = 1.0
+RIGHT_BALANCE = 0.79
+
+# Gripper parameters (servo angle, degrees)
+GRIP_START = 80
+GRIP_OPEN = 60
+GRIP_CLOSED = 110
+GRIP_RELEASE = 150
+LEFT_TRIM = 0
+RIGHT_TRIM = 0
+GRIP_STEP = 3
+GRIP_SMOOTHING = 0.35
+GRIP_PAUSE_HOLD = False
+
+# Arm parameters (dual encoder motor)
+ARM_DIR_A = 1
+ARM_DIR_B = -1
+ARM_DIRECTION = -1
+THROW_DIRECTION = 1
+ARM_CURVE = 2
+ARM_MAX_POWER = 50
+ARM_HOLD = True
+ARM_HOLD_SIGN = 1
+ARM_HOLD_POWER = 30
+ARM_HOLD_DEADBAND = 6
+ARM_HOLD_INNER = 1
+ARM_SETTLE_TIME = 0.3
+ARM_SLEW = 15
+
+# Launch parameters (seconds)
+THROW_TIME = 0.11
+THROW_RELEASE = 0.085
+THROW_BIG_EXTRA = 0.04
+THROW_BRAKE_TIME = 0.03
+
+# Arm retraction parameters
+COCK_POWER = 28
+COCK_TIME = 0.5
+
+# Ready-position parameters (encoder degrees from start-up position)
+READY_ANGLE = -90
+READY_TOLERANCE = 3
+READY_POWER = 28
+READY_SIGN = 1
+READY_TIMEOUT = 2.0
+
+
+def deadzone(v):
+    return 0 if abs(v) < DEADZONE else v
+
+
+def clamp(v, lo=-100, hi=100):
+    return max(lo, min(hi, v))
+
+
+def set_gripper(angle):
+    left = int(round(max(0, min(180, angle + LEFT_TRIM))))
+    right = int(round(max(0, min(180, 180 - angle + RIGHT_TRIM))))
+    mbot2.servo_set(left, LEFT_SERVO)
+    mbot2.servo_set(right, RIGHT_SERVO)
+
+
+def stop_drive():
+    mbot2.motor_set(0, LEFT_DRIVE)
+    mbot2.motor_set(0, RIGHT_DRIVE)
+
+
+def arm_power(p):
+    mbot2.EM_set_power(p * ARM_DIR_A, ARM_A)
+    mbot2.EM_set_power(p * ARM_DIR_B, ARM_B)
+
+
+def arm_stop():
+    mbot2.EM_stop(ARM_A)
+    mbot2.EM_stop(ARM_B)
+
+
+def arm_angle():
+    return mbot2.EM_get_angle(ARM_A)
+
+
+def throw(throw_time, release_time, release_angle):
+    stop_drive()
+    power = 100 * THROW_DIRECTION
+    arm_power(power)
+    if release_time < throw_time:
+        time.sleep(release_time)
+        set_gripper(release_angle)
+        time.sleep(throw_time - release_time)
+        arm_power(-power)
+        time.sleep(THROW_BRAKE_TIME)
+    else:
+        time.sleep(throw_time)
+        arm_power(-power)
+        time.sleep(THROW_BRAKE_TIME)
+        set_gripper(release_angle)
+    arm_stop()
+
+
+def go_to_angle(target):
+    stop_drive()
+    start = time.time()
+    while time.time() - start < READY_TIMEOUT:
+        error = target - arm_angle()
+        if abs(error) < READY_TOLERANCE:
+            break
+        direction = 1 if error > 0 else -1
+        arm_power(READY_POWER * direction * READY_SIGN)
+        time.sleep(0.01)
+    arm_stop()
+    cyberpi.console.println("ARM POS: " + str(int(arm_angle())) + " deg")
+
 
 @event.start
 def main():
-    cyberpi.console.println("Drive Ready")
+    mbot2.EM_reset_angle(ARM_A)
+    mbot2.EM_reset_angle(ARM_B)
+    ready_angle = READY_ANGLE
+
+    grip_target = GRIP_START
+    grip_pos = GRIP_START
+    grip_sent = int(round(grip_pos))
+    set_gripper(grip_pos)
+
+    arm_hold_target = None
+    arm_release_time = None
+    arm_correcting = False
+    arm_cmd = 0
+    fire_was_pressed = False
+    big_was_pressed = False
+
+    cyberpi.console.println("SYSTEM INIT OK")
+    cyberpi.console.println("ENCODER ZEROED")
+    cyberpi.console.println("READY POS: " + str(int(ready_angle)) + " deg")
+    cyberpi.console.println("STATUS: OPERATIONAL")
+
     while True:
-        # Read Left Joystick Y (throttle) and X (steering) from Bluetooth Gamepad
-        joyY = gamepad.get_joystick("Ly")
-        joyX = gamepad.get_joystick("Lx")
+        # Drive (arcade mixing)
+        joyY = deadzone(gamepad.get_joystick("Ly")) * DRIVE_DIRECTION * DRIVE_BOOST
+        joyX = deadzone(gamepad.get_joystick("Lx")) * DRIVE_BOOST
+        left_speed = clamp(joyY + joyX) * LEFT_BALANCE
+        right_speed = clamp(joyY - joyX) * RIGHT_BALANCE
+        mbot2.motor_set(left_speed, LEFT_DRIVE)
+        mbot2.motor_set(-right_speed, RIGHT_DRIVE)
 
-        # Deadzone to prevent stick drift
-        if abs(joyY) < 10:
-            joyY = 0
-        if abs(joyX) < 10:
-            joyX = 0
+        # Arm (manual control with position hold)
+        armY = deadzone(gamepad.get_joystick("Ry"))
+        claws_moving = gamepad.is_key_pressed("L1") or gamepad.is_key_pressed("R1")
+        if armY == 0:
+            if GRIP_PAUSE_HOLD and claws_moving:
+                arm_stop()
+                arm_hold_target = None
+                arm_release_time = None
+            elif arm_release_time is None:
+                arm_release_time = time.time()
+                arm_cmd = 0
+                arm_stop()
+            elif not ARM_HOLD or time.time() - arm_release_time < ARM_SETTLE_TIME:
+                arm_stop()
+            else:
+                if arm_hold_target is None:
+                    arm_hold_target = arm_angle()
+                error = arm_hold_target - arm_angle()
+                if not arm_correcting and abs(error) > ARM_HOLD_DEADBAND:
+                    arm_correcting = True
+                if arm_correcting and abs(error) < ARM_HOLD_INNER:
+                    arm_correcting = False
+                if arm_correcting:
+                    direction = 1 if error > 0 else -1
+                    hold = ARM_HOLD_POWER * direction * ARM_HOLD_SIGN
+                    mbot2.EM_set_power(hold, ARM_A)
+                    mbot2.EM_set_power(hold * ARM_DIR_B * ARM_DIR_A, ARM_B)
+                else:
+                    arm_stop()
+        else:
+            arm_hold_target = None
+            arm_release_time = None
+            mag = ((abs(armY) / 100) ** ARM_CURVE) * ARM_MAX_POWER
+            sign = 1 if armY > 0 else -1
+            wanted = clamp(mag) * sign * ARM_DIRECTION
+            arm_cmd += clamp(wanted - arm_cmd, -ARM_SLEW, ARM_SLEW)
+            arm_power(arm_cmd)
 
-        # Arcade drive mixing clamped to [-100, 100]
-        left_speed = max(-100, min(100, joyY + joyX))
-        right_speed = max(-100, min(100, joyY - joyX))
+        # Gripper
+        lo = min(GRIP_OPEN, GRIP_CLOSED)
+        hi = max(GRIP_OPEN, GRIP_CLOSED)
+        if gamepad.is_key_pressed("L1"):
+            step = -GRIP_STEP if GRIP_OPEN < GRIP_CLOSED else GRIP_STEP
+            grip_target = max(lo, min(hi, grip_target + step))
+        elif gamepad.is_key_pressed("R1"):
+            step = GRIP_STEP if GRIP_OPEN < GRIP_CLOSED else -GRIP_STEP
+            grip_target = max(lo, min(hi, grip_target + step))
 
-        # For 2-pin DC motors on ports M1 and M2 (power first, port second!)
-        mbot2.motor_set(left_speed, LEFT_PORT)
-        mbot2.motor_set(-right_speed, RIGHT_PORT)
+        if gamepad.is_key_pressed("Up"):
+            grip_target = GRIP_START
 
-        # NOTE: If using Encoder Motors on EM1 & EM2 instead of M1 & M2,
-        # comment out the two motor_set lines above and uncomment this line:
-        # mbot2.drive_power(left_speed, -right_speed)
+        grip_pos += (grip_target - grip_pos) * GRIP_SMOOTHING
+        if abs(grip_target - grip_pos) < 0.2:
+            grip_pos = grip_target
+
+        new_grip = int(round(grip_pos))
+        if new_grip != grip_sent:
+            set_gripper(grip_pos)
+            grip_sent = new_grip
+
+        # Arm retraction (timed)
+        if gamepad.is_key_pressed("Down"):
+            cyberpi.console.println("ARM: RETRACT")
+            stop_drive()
+            arm_power(-COCK_POWER * THROW_DIRECTION)
+            time.sleep(COCK_TIME)
+            arm_stop()
+            time.sleep(0.15)
+            arm_hold_target = arm_angle()
+            arm_release_time = time.time() - ARM_SETTLE_TIME
+            arm_correcting = False
+            cyberpi.console.println("ARM POS: " + str(int(arm_hold_target)) + " deg")
+            while gamepad.is_key_pressed("Down"):
+                time.sleep(0.02)
+
+        # Arm to ready position (closed-loop)
+        if gamepad.is_key_pressed("Left"):
+            cyberpi.console.println("ARM: SEEK READY POS")
+            go_to_angle(ready_angle)
+            time.sleep(0.15)
+            arm_hold_target = arm_angle()
+            arm_release_time = time.time() - ARM_SETTLE_TIME
+            arm_correcting = False
+            while gamepad.is_key_pressed("Left"):
+                time.sleep(0.02)
+
+        # Store current arm position as ready position
+        if gamepad.is_key_pressed("Right"):
+            ready_angle = arm_angle()
+            cyberpi.console.println("READY POS SET: " + str(int(ready_angle)) + " deg")
+            while gamepad.is_key_pressed("Right"):
+                time.sleep(0.02)
+
+        # Launch
+        fire_pressed = gamepad.is_key_pressed("R2")
+        big_pressed = gamepad.is_key_pressed("L2")
+
+        thrown = False
+        if fire_pressed and not fire_was_pressed:
+            cyberpi.console.println("LAUNCH: PROFILE A")
+            release_angle = GRIP_RELEASE
+            throw(THROW_TIME, THROW_RELEASE, release_angle)
+            thrown = True
+        elif big_pressed and not big_was_pressed:
+            cyberpi.console.println("LAUNCH: PROFILE B")
+            release_angle = GRIP_RELEASE
+            throw(THROW_TIME + THROW_BIG_EXTRA, THROW_RELEASE + THROW_BIG_EXTRA, release_angle)
+            thrown = True
+
+        if thrown:
+            cyberpi.console.println("LAUNCH COMPLETE")
+            grip_target = release_angle
+            grip_pos = release_angle
+            grip_sent = int(round(grip_pos))
+            arm_hold_target = None
+            arm_release_time = None
+            arm_correcting = False
+
+        fire_was_pressed = fire_pressed
+        big_was_pressed = big_pressed
 
         time.sleep(0.02)
